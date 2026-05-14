@@ -58,8 +58,8 @@ sudo dnf install gcc make ncurses-devel
 ### 2. Clone or download the project
 
 ```bash
-git clone <your-repo-url>
-cd System-monitor
+git clone https://github.com/ducnguyen2304/cs211_system_monitor.git
+cd cs211_system_monitor
 ```
 
 Or if you downloaded a zip:

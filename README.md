@@ -99,31 +99,110 @@ make clean
 
 ## Windows — Setup & Run (via WSL2)
 
-> This program uses the Linux `/proc` filesystem, so it cannot run natively on Windows.  
-> WSL2 (Windows Subsystem for Linux) gives you a full Linux environment inside Windows.
+> This program uses the Linux `/proc` filesystem, so it **cannot run natively on Windows**.  
+> The solution is **WSL2** (Windows Subsystem for Linux) — a free tool from Microsoft that gives you a real Linux terminal inside Windows. No dual-boot, no virtual machine setup needed.
 
-### 1. Enable WSL2
+---
 
-Open **PowerShell as Administrator** and run:
+### Step 1 — Check your Windows version
+
+WSL2 requires **Windows 10 version 2004 or later**, or **Windows 11**.
+
+To check: press `Win + R`, type `winver`, press Enter. You will see your version number.
+
+---
+
+### Step 2 — Enable WSL2
+
+1. Click the **Start menu**
+2. Search for **"PowerShell"**
+3. Right-click it → select **"Run as administrator"**
+4. A blue terminal window opens. Paste this command and press Enter:
+
 ```powershell
 wsl --install
 ```
-Restart your computer when prompted. This installs Ubuntu by default.
 
-### 2. Open WSL2
+This automatically installs WSL2 and Ubuntu. It will take a few minutes to download.
 
-After restart, search **"Ubuntu"** in the Start menu and open it.  
-First launch will ask you to create a username and password.
+5. When it finishes, **restart your computer**.
 
-### 3. Follow the Linux instructions above
+> If you see an error like `wsl: command not found`, your Windows is too old. Update Windows first via Settings → Windows Update.
 
-Inside the WSL2 terminal, run exactly the same commands as Linux:
+---
+
+### Step 3 — Set up Ubuntu for the first time
+
+1. After restarting, the **Ubuntu** app will open automatically.  
+   (If it doesn't, open the Start menu and search for **"Ubuntu"**.)
+2. Wait for it to finish installing — this takes about 1–2 minutes.
+3. It will ask you to create a **username** and **password**.
+   - This is your Linux account — it does not have to match your Windows account.
+   - When typing the password, nothing will appear on screen — that is normal.
+
+You now have a Linux terminal running inside Windows.
+
+---
+
+### Step 4 — Install required tools
+
+Inside the Ubuntu terminal, type these commands one by one and press Enter after each:
+
 ```bash
 sudo apt-get update
-sudo apt-get install -y gcc make libncurses-dev
-# then clone/download the project and:
+```
+> It will ask for the password you just created. Type it and press Enter.
+
+```bash
+sudo apt-get install -y gcc make libncurses-dev git
+```
+
+Wait for it to finish. This installs the compiler, build tool, display library, and git.
+
+---
+
+### Step 5 — Clone the project
+
+Still inside the Ubuntu terminal, run:
+
+```bash
+git clone https://github.com/ducnguyen2304/cs211_system_monitor.git
+```
+
+Then move into the project folder:
+
+```bash
+cd cs211_system_monitor
+```
+
+---
+
+### Step 6 — Build the program
+
+```bash
 make
+```
+
+You should see several lines starting with `gcc ...`. That means it compiled successfully.
+
+---
+
+### Step 7 — Run the program
+
+```bash
 ./sysmon
+```
+
+The system monitor will launch in your terminal. Press **`q`** to quit.
+
+---
+
+### Step 8 — Clean build files (optional)
+
+If you want to remove compiled files and start fresh:
+
+```bash
+make clean
 ```
 
 ---

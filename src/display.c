@@ -2,42 +2,73 @@
 #include <ncurses.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <sched.h>
 
-#define BAR_WIDTH 30
+/* SCHED_BATCH and SCHED_IDLE may not be defined on all kernels */
+#ifndef SCHED_BATCH
+#define SCHED_BATCH 3
+#endif
+#ifndef SCHED_IDLE
+#define SCHED_IDLE 5
+#endif
 
-static void draw_bar(int y, int x, double pct, int color_pair) {
+#define BAR_WIDTH 28
+
+/* color pairs */
+#define CP_GREEN  1
+#define CP_YELLOW 2
+#define CP_RED    3
+#define CP_CYAN   4
+#define CP_WHITE  5
+#define CP_BLUE   6
+
+static void draw_bar(int y, int x, double pct, int cp) {
     int filled = (int)(pct / 100.0 * BAR_WIDTH);
     if (filled > BAR_WIDTH) filled = BAR_WIDTH;
-
     mvprintw(y, x, "[");
-    attron(COLOR_PAIR(color_pair));
+    attron(COLOR_PAIR(cp));
     for (int i = 0; i < BAR_WIDTH; i++)
         addch(i < filled ? '|' : ' ');
-    attroff(COLOR_PAIR(color_pair));
+    attroff(COLOR_PAIR(cp));
     printw("] %5.1f%%", pct);
 }
 
 static int bar_color(double pct) {
-    if (pct >= 80.0) return 3;   /* red */
-    if (pct >= 50.0) return 2;   /* yellow */
-    return 1;                    /* green */
+    if (pct >= 80.0) return CP_RED;
+    if (pct >= 50.0) return CP_YELLOW;
+    return CP_GREEN;
+}
+
+static const char *policy_str(int policy) {
+    switch (policy) {
+        case SCHED_OTHER:    return "NRM";
+        case SCHED_FIFO:     return "FIF";
+        case SCHED_RR:       return "RR ";
+        case SCHED_BATCH:    return "BAT";
+        case SCHED_IDLE:     return "IDL";
+#ifdef SCHED_DEADLINE
+        case SCHED_DEADLINE: return "DL ";
+#endif
+        default:             return "?  ";
+    }
 }
 
 void display_init(void) {
     initscr();
-    cbreak();
+    halfdelay(2);   /* getch() times out after 200 ms — keeps UI responsive */
     noecho();
     curs_set(0);
-    nodelay(stdscr, TRUE);
     keypad(stdscr, TRUE);
 
     if (has_colors()) {
         start_color();
-        init_pair(1, COLOR_GREEN,  COLOR_BLACK);
-        init_pair(2, COLOR_YELLOW, COLOR_BLACK);
-        init_pair(3, COLOR_RED,    COLOR_BLACK);
-        init_pair(4, COLOR_CYAN,   COLOR_BLACK);
-        init_pair(5, COLOR_WHITE,  COLOR_BLACK);
+        init_pair(CP_GREEN,  COLOR_GREEN,  COLOR_BLACK);
+        init_pair(CP_YELLOW, COLOR_YELLOW, COLOR_BLACK);
+        init_pair(CP_RED,    COLOR_RED,    COLOR_BLACK);
+        init_pair(CP_CYAN,   COLOR_CYAN,   COLOR_BLACK);
+        init_pair(CP_WHITE,  COLOR_WHITE,  COLOR_BLACK);
+        init_pair(CP_BLUE,   COLOR_BLUE,   COLOR_BLACK);
     }
 }
 
@@ -45,17 +76,96 @@ void display_cleanup(void) {
     endwin();
 }
 
-void display_update(const CpuInfo *cpu, const MemInfo *mem, const ProcList *procs) {
+/* ── prompt helpers ──────────────────────────────────────────────────── */
+
+int display_prompt_confirm(const char *msg) {
+    int max_y, max_x;
+    getmaxyx(stdscr, max_y, max_x);
+    (void)max_x;
+
+    cbreak();
+    echo();
+    curs_set(1);
+    nodelay(stdscr, FALSE);
+
+    move(max_y - 1, 0);
+    clrtoeol();
+    attron(A_BOLD | COLOR_PAIR(CP_RED));
+    mvprintw(max_y - 1, 0, " %s [y/N] ", msg);
+    attroff(A_BOLD | COLOR_PAIR(CP_RED));
+    refresh();
+
+    int ch = getch();
+
+    noecho();
+    curs_set(0);
+    halfdelay(2);
+
+    return (ch == 'y' || ch == 'Y');
+}
+
+int display_prompt_int(const char *msg, int *out) {
+    int max_y, max_x;
+    getmaxyx(stdscr, max_y, max_x);
+    (void)max_x;
+
+    cbreak();
+    echo();
+    curs_set(1);
+    nodelay(stdscr, FALSE);
+
+    move(max_y - 1, 0);
+    clrtoeol();
+    attron(A_BOLD | COLOR_PAIR(CP_CYAN));
+    mvprintw(max_y - 1, 0, " %s: ", msg);
+    attroff(A_BOLD | COLOR_PAIR(CP_CYAN));
+    refresh();
+
+    char buf[32] = {0};
+    wgetnstr(stdscr, buf, (int)sizeof(buf) - 1);
+
+    noecho();
+    curs_set(0);
+    halfdelay(2);
+
+    char *end;
+    long val = strtol(buf, &end, 10);
+    if (end == buf) return -1;   /* no digits */
+    *out = (int)val;
+    return 0;
+}
+
+/* ── main display ────────────────────────────────────────────────────── */
+
+void display_update(const CpuInfo *cpu, const MemInfo *mem, const ProcList *procs,
+                    int selected, int show_threads, int *selected_pid) {
     int max_y, max_x;
     getmaxyx(stdscr, max_y, max_x);
     clear();
 
+    /* Build visible list: indices into procs->procs that pass the filter */
+    int vis[MAX_PROCS];
+    int vis_count = 0;
+    for (int i = 0; i < procs->count; i++) {
+        const ProcInfo *p = &procs->procs[i];
+        if (p->cpu_percent < 0.01 && p->mem_kb == 0) continue;
+        vis[vis_count++] = i;
+    }
+
+    /* Clamp selection */
+    if (vis_count == 0) selected = 0;
+    else if (selected >= vis_count) selected = vis_count - 1;
+    else if (selected < 0)          selected = 0;
+
+    if (selected_pid)
+        *selected_pid = (vis_count > 0) ? procs->procs[vis[selected]].pid : -1;
+
     int row = 0;
 
     /* ── Header ── */
-    attron(A_BOLD | COLOR_PAIR(4));
-    mvprintw(row++, 0, " System Monitor  (press 'q' to quit)");
-    attroff(A_BOLD | COLOR_PAIR(4));
+    attron(A_BOLD | COLOR_PAIR(CP_CYAN));
+    mvprintw(row++, 0, " System Monitor  (q=quit  ↑↓=select  t=threads  k=kill  r=renice  s=signal)");
+    attroff(A_BOLD | COLOR_PAIR(CP_CYAN));
     mvhline(row++, 0, ACS_HLINE, max_x);
 
     /* ── CPU Section ── */
@@ -63,13 +173,11 @@ void display_update(const CpuInfo *cpu, const MemInfo *mem, const ProcList *proc
     mvprintw(row++, 0, " CPU  (%d cores)", cpu->num_cores);
     attroff(A_BOLD);
 
-    /* Overall */
     mvprintw(row, 2, "Total ");
     draw_bar(row++, 8, cpu->total_usage, bar_color(cpu->total_usage));
 
-    /* Per-core (two columns if space allows) */
     int cols = (max_x >= 80) ? 2 : 1;
-    for (int i = 0; i < cpu->num_cores && row < max_y - 10; i++) {
+    for (int i = 0; i < cpu->num_cores && row < max_y - 12; i++) {
         int col = i % cols;
         int cx  = col * (max_x / cols);
         if (col == 0 && i != 0) row++;
@@ -84,9 +192,8 @@ void display_update(const CpuInfo *cpu, const MemInfo *mem, const ProcList *proc
     mvprintw(row++, 0, " Memory");
     attroff(A_BOLD);
 
-    double mem_pct = mem->used_percent;
     mvprintw(row, 2, "RAM   ");
-    draw_bar(row++, 8, mem_pct, bar_color(mem_pct));
+    draw_bar(row++, 8, mem->used_percent, bar_color(mem->used_percent));
     mvprintw(row++, 2, "  %ld MB used / %ld MB total  (avail: %ld MB)",
              mem->used_kb / 1024, mem->total_kb / 1024, mem->available_kb / 1024);
 
@@ -102,25 +209,50 @@ void display_update(const CpuInfo *cpu, const MemInfo *mem, const ProcList *proc
     /* ── Process Section ── */
     attron(A_BOLD);
     mvprintw(row++, 0, " Processes (%d)", procs->count);
-    mvprintw(row++, 0, " %-7s %-20s %5s  %8s  %c",
-             "PID", "Name", "CPU%", "Mem(MB)", 'S');
+    /*           PID     Name             CPU%   Mem(MB)  S   NI  PRI  POL   THR */
+    mvprintw(row++, 0, " %-7s %-18s %5s  %8s  %c  %3s %3s  %-4s %3s",
+             "PID", "Name", "CPU%", "Mem(MB)", 'S', "NI", "PRI", "POL", "THR");
     attroff(A_BOLD);
 
-    int shown = 0;
-    for (int i = 0; i < procs->count && row < max_y - 1; i++) {
-        const ProcInfo *p = &procs->procs[i];
-        /* Skip idle/zombie processes with 0 cpu and 0 mem (kernel threads) */
-        if (p->cpu_percent < 0.01 && p->mem_kb == 0) continue;
+    int proc_start_row = row;
 
-        mvprintw(row++, 0, " %-7d %-20.20s %5.1f  %8.2f  %c",
+    for (int vi = 0; vi < vis_count && row < max_y - 2; vi++) {
+        const ProcInfo *p = &procs->procs[vis[vi]];
+        int is_selected   = (vi == selected);
+
+        if (is_selected) attron(A_REVERSE);
+
+        mvprintw(row++, 0, " %-7d %-18.18s %5.1f  %8.2f  %c  %3d %3d  %-4s %3d",
                  p->pid, p->name,
                  p->cpu_percent,
                  (double)p->mem_kb / 1024.0,
-                 p->state);
-        shown++;
-        if (shown >= 20) break;
-    }
+                 p->state,
+                 p->nice, p->priority,
+                 policy_str(p->sched_policy),
+                 p->num_threads);
 
-    mvhline(max_y - 1, 0, ACS_HLINE, max_x);
+        if (is_selected) attroff(A_REVERSE);
+
+        /* Thread expansion for selected process (feature 1) */
+        if (is_selected && show_threads && p->num_threads > 0) {
+            attron(COLOR_PAIR(CP_BLUE));
+            for (int ti = 0; ti < p->num_threads && row < max_y - 2; ti++) {
+                const ThreadInfo *th = &p->threads[ti];
+                mvprintw(row++, 4, "  TID:%-7d  state:%c  cpu:%5.1f%%",
+                         th->tid, th->state, th->cpu_percent);
+            }
+            attroff(COLOR_PAIR(CP_BLUE));
+        }
+    }
+    (void)proc_start_row;
+
+    /* ── Status bar ── */
+    mvhline(max_y - 2, 0, ACS_HLINE, max_x);
+    attron(COLOR_PAIR(CP_CYAN));
+    mvprintw(max_y - 1, 0,
+             " q:quit  arrows:select  t:threads  k:kill  r:renice  s:signal(%d sel)",
+             selected_pid ? *selected_pid : -1);
+    attroff(COLOR_PAIR(CP_CYAN));
+
     refresh();
 }

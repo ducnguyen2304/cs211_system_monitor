@@ -1,6 +1,6 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -I include
-LDFLAGS = -lncurses
+LDFLAGS = -lncurses -lpthread
 TARGET  = sysmon
 SRCS    = src/main.c src/cpu.c src/memory.c src/process.c src/display.c
 OBJS    = $(SRCS:.c=.o)

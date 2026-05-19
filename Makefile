@@ -1,3 +1,9 @@
+# Makefile – System Monitor build rules
+#
+# Targets:
+#   all    (default) – compile and link the sysmon binary
+#   clean            – remove object files and the binary
+
 CC      = gcc
 CFLAGS  = -Wall -Wextra -I include
 LDFLAGS = -lncurses -lpthread
@@ -10,6 +16,7 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+# Compile each .c file to a .o file in the same directory.
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 

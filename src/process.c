@@ -1,3 +1,20 @@
+/**
+ * @file process.c
+ * @brief Process and thread enumeration via /proc.
+ *
+ * CPU usage is computed as a fraction of the total system CPU ticks consumed
+ * in the interval between proc_sample() and proc_get_list().  The same
+ * delta_cpu denominator is used for both process-level and thread-level
+ * percentages so all values are on a consistent 0–100 scale regardless of
+ * the number of cores.
+ *
+ * Data flow:
+ *   proc_sample()    → reads /proc/[pid]/stat and /proc/[pid]/task/[tid]/stat
+ *                      for every visible PID; stores tick counters in prev_ticks[].
+ *   proc_get_list()  → reads the same files again, diffs against prev_ticks[],
+ *                      and fills a ProcList sorted by descending CPU%.
+ */
+
 #include "process.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,12 +24,14 @@
 #include <sched.h>
 #include <sys/resource.h>
 
+/** Tick counters for a single thread, used to compute per-thread CPU deltas. */
 typedef struct {
     int       tid;
     long long utime;
     long long stime;
 } ThreadTick;
 
+/** Tick counters for a process and all of its threads. */
 typedef struct {
     int        pid;
     long long  utime;
@@ -21,10 +40,20 @@ typedef struct {
     int        num_thread_ticks;
 } ProcTicks;
 
+/* Baseline snapshots captured by the last proc_sample() call. */
 static ProcTicks prev_ticks[MAX_PROCS];
 static int       prev_count     = 0;
 static long long prev_cpu_total = 0;
 
+/**
+ * @brief Read the total system CPU tick count from /proc/stat.
+ *
+ * Sums all ten tick fields of the aggregate "cpu" line.  Used as the
+ * denominator when computing per-process CPU percentages so that the
+ * result is naturally normalised across all cores.
+ *
+ * @return Total ticks since boot, or 0 if /proc/stat cannot be opened.
+ */
 static long long read_cpu_total(void) {
     FILE *f = fopen("/proc/stat", "r");
     if (!f) return 0;
@@ -38,16 +67,36 @@ static long long read_cpu_total(void) {
     return sum;
 }
 
+/**
+ * @brief Return non-zero if @p name is a non-empty decimal string.
+ *
+ * Used to identify PID/TID directories inside /proc (and /proc/[pid]/task)
+ * while skipping ".", "..", and named entries like "self".
+ */
 static int is_pid_dir(const char *name) {
     for (int i = 0; name[i]; i++)
         if (!isdigit((unsigned char)name[i])) return 0;
     return name[0] != '\0';
 }
 
-/*
- * Parse a /proc/[pid]/stat (or /proc/[pid]/task/[tid]/stat) file.
- * Reads through field 20 (num_threads). All out-pointers are optional.
- * Returns 0 on success, -1 on failure.
+/**
+ * @brief Parse fields 1–20 from a /proc/[pid]/stat (or task/[tid]/stat) file.
+ *
+ * All output parameters are optional; pass NULL for any field not needed.
+ * The function reads through field 20 (num_threads) even when only earlier
+ * fields are requested so the format string always consumes the correct input.
+ *
+ * @param path            Path to the stat file.
+ * @param pid_hint        Fallback PID/TID used if the file cannot be parsed.
+ * @param name_out        Receives the command name (stripped of parentheses).
+ * @param state_out       Receives the single-character process state.
+ * @param utime_out       Receives user-mode ticks (field 14).
+ * @param stime_out       Receives kernel-mode ticks (field 15).
+ * @param priority_out    Receives the kernel priority (field 18).
+ * @param nice_out        Receives the nice value (field 19).
+ * @param num_threads_out Receives the thread count (field 20).
+ * @return                0 on success, -1 if the file could not be read or
+ *                        fewer than 15 fields were successfully parsed.
  */
 static int read_stat_file(const char *path, int pid_hint,
                            char *name_out, char *state_out,
@@ -65,13 +114,22 @@ static int read_stat_file(const char *path, int pid_hint,
     unsigned long skip_ul;
     int       pid = pid_hint;
 
-    /* fields 1-20 of /proc/pid/stat */
+    /*
+     * /proc/pid/stat format (selected fields):
+     *   1  pid           2  comm (name in parens)  3  state
+     *   4  ppid          5  pgrp                   6  session
+     *   7  tty_nr        8  tpgid                  9  flags
+     *  10  minflt       11  cminflt               12  majflt
+     *  13  cmajflt      14  utime                 15  stime
+     *  16  cutime       17  cstime                18  priority
+     *  19  nice         20  num_threads
+     */
     int r = fscanf(f, "%d (%63[^)]) %c "
-                      "%ld %ld %ld %ld %ld %lu "   /* ppid..flags */
-                      "%lu %lu %lu %lu "            /* minflt..cmajflt */
-                      "%lld %lld "                  /* utime stime */
-                      "%lld %lld "                  /* cutime cstime */
-                      "%ld %ld %ld",                /* priority nice num_threads */
+                      "%ld %ld %ld %ld %ld %lu "
+                      "%lu %lu %lu %lu "
+                      "%lld %lld "
+                      "%lld %lld "
+                      "%ld %ld %ld",
                    &pid, comm, &state,
                    &skip_l, &skip_l, &skip_l, &skip_l, &skip_l, &skip_ul,
                    &skip_ul, &skip_ul, &skip_ul, &skip_ul,
@@ -92,6 +150,15 @@ static int read_stat_file(const char *path, int pid_hint,
     return 0;
 }
 
+/**
+ * @brief Read the resident set size (VmRSS) for process @p pid.
+ *
+ * VmRSS is the portion of the process's address space that currently
+ * resides in physical RAM, excluding swapped-out pages.
+ *
+ * @param pid  Target process ID.
+ * @return     VmRSS in kibibytes, or 0 if the file cannot be read.
+ */
 static long read_proc_mem(int pid) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/status", pid);
@@ -107,9 +174,16 @@ static long read_proc_mem(int pid) {
     return value;
 }
 
-/*
- * Scan /proc/[pid]/task/ for all threads.
- * Fills t->thread_ticks[] and (if p != NULL) p->threads[] in parallel.
+/**
+ * @brief Enumerate all threads of @p pid and record their tick counters.
+ *
+ * Scans /proc/[pid]/task/ and reads each thread's stat file.  Results are
+ * stored in @p t (raw ticks) and optionally in @p p (display-ready ThreadInfo
+ * structs with cpu_percent initialised to 0.0).
+ *
+ * @param pid  Process whose thread directory is scanned.
+ * @param t    Output ProcTicks struct; thread_ticks[] is populated.
+ * @param p    Optional output ProcInfo struct; threads[] is populated when non-NULL.
  */
 static void read_proc_threads(int pid, ProcTicks *t, ProcInfo *p) {
     char dir_path[64];
@@ -181,6 +255,7 @@ void proc_sample(void) {
     closedir(dir);
 }
 
+/** Compare two ProcInfo entries by descending cpu_percent for qsort. */
 static int cmp_cpu(const void *a, const void *b) {
     const ProcInfo *pa = a, *pb = b;
     if (pb->cpu_percent > pa->cpu_percent) return  1;
@@ -214,7 +289,7 @@ void proc_get_list(ProcList *list) {
         p.pid    = pid;
         p.mem_kb = read_proc_mem(pid);
 
-        /* scheduling policy via syscall */
+        /* Retrieve the scheduling policy; fall back to SCHED_OTHER on error. */
         int policy = sched_getscheduler(pid);
         p.sched_policy = (policy >= 0) ? policy : 0;
         if (policy == SCHED_FIFO || policy == SCHED_RR) {
@@ -223,31 +298,32 @@ void proc_get_list(ProcList *list) {
                 p.rt_priority = sp.sched_priority;
         }
 
-        /* find previous sample for this pid */
+        /* Locate the baseline tick record for this PID (linear scan is fine
+         * for MAX_PROCS ≤ 512 entries measured once per second). */
         ProcTicks *prev = NULL;
         for (int i = 0; i < prev_count; i++) {
             if (prev_ticks[i].pid == pid) { prev = &prev_ticks[i]; break; }
         }
 
-        /* process cpu% */
+        /* Process-level CPU%: Δ(utime+stime) / Δtotal_cpu × 100 */
         if (prev && delta_cpu > 0) {
             long long dp = (cur_utime + cur_stime) - (prev->utime + prev->stime);
             p.cpu_percent = (double)dp / delta_cpu * 100.0;
         }
 
-        /* collect thread ticks for this sample (parallel to p.threads[]) */
+        /* Collect current thread ticks and compute per-thread CPU% in parallel. */
         ProcTicks cur_ticks = {0};
         cur_ticks.pid   = pid;
         cur_ticks.utime = cur_utime;
         cur_ticks.stime = cur_stime;
         read_proc_threads(pid, &cur_ticks, &p);
 
-        /* per-thread cpu% using same delta_cpu denominator */
         if (prev && delta_cpu > 0) {
             for (int ti = 0; ti < cur_ticks.num_thread_ticks; ti++) {
                 int tid = cur_ticks.thread_ticks[ti].tid;
                 long long cur_tt = cur_ticks.thread_ticks[ti].utime
                                  + cur_ticks.thread_ticks[ti].stime;
+                /* Find the matching baseline thread entry. */
                 long long prev_tt = 0;
                 for (int pi = 0; pi < prev->num_thread_ticks; pi++) {
                     if (prev->thread_ticks[pi].tid == tid) {

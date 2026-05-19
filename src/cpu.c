@@ -1,25 +1,69 @@
+/**
+ * @file cpu.c
+ * @brief CPU utilisation sampling via /proc/stat.
+ *
+ * The Linux kernel exposes cumulative CPU tick counters in /proc/stat.
+ * This module snapshots those counters twice and computes the fraction of
+ * non-idle ticks in the interval, giving a usage percentage per core and
+ * in aggregate.
+ *
+ * Formula: CPU% = (1 − Δidle / Δtotal) × 100
+ */
+
 #include "cpu.h"
 #include <stdio.h>
 #include <string.h>
 
-/* Raw tick counters read from /proc/stat */
+/**
+ * @brief Raw tick counters for a single CPU line in /proc/stat.
+ *
+ * Each field counts jiffies (kernel time units) spent in the
+ * corresponding mode since boot.
+ *
+ * Fields (in /proc/stat column order):
+ *   user    – normal user-space time
+ *   nice    – low-priority user-space time
+ *   system  – kernel time
+ *   idle    – truly idle time
+ *   iowait  – waiting on I/O (CPU is idle but stalled)
+ *   irq     – servicing hardware interrupts
+ *   softirq – servicing software interrupts
+ *   steal   – time stolen by a hypervisor (meaningful on VMs)
+ */
 typedef struct {
     long long user, nice, system, idle, iowait, irq, softirq, steal;
 } CpuTicks;
 
-static CpuTicks prev[MAX_CORES + 1];  /* index 0 = aggregate "cpu" line */
+/* index 0 = aggregate "cpu" line; 1..MAX_CORES = per-core "cpuN" lines */
+static CpuTicks prev[MAX_CORES + 1];
 static int      num_cores = 0;
 
+/** Sum all tick fields to obtain the total elapsed ticks for a snapshot. */
 static long long total(const CpuTicks *t) {
     return t->user + t->nice + t->system + t->idle +
            t->iowait + t->irq + t->softirq + t->steal;
 }
 
+/**
+ * @brief Return the number of idle ticks in a snapshot.
+ *
+ * iowait is counted as idle because the CPU is not executing instructions
+ * while waiting for I/O to complete.
+ */
 static long long idle_ticks(const CpuTicks *t) {
     return t->idle + t->iowait;
 }
 
-/* Read current tick values from /proc/stat into `cur`. */
+/**
+ * @brief Read all CPU tick lines from /proc/stat into @p cur.
+ *
+ * Reads the aggregate "cpu" line (index 0) followed by up to MAX_CORES
+ * per-core "cpuN" lines.  Stops at the first non-"cpu" line.
+ *
+ * @param cur    Output array; must have capacity MAX_CORES + 1.
+ * @param cores  Set to the number of per-core lines parsed (not counting index 0).
+ * @return       0 on success, -1 if /proc/stat cannot be opened.
+ */
 static int read_stat(CpuTicks cur[], int *cores) {
     FILE *f = fopen("/proc/stat", "r");
     if (!f) return -1;
@@ -39,7 +83,7 @@ static int read_stat(CpuTicks cur[], int *cores) {
     }
     fclose(f);
 
-    /* idx=0 is aggregate; idx-1 is count of per-core entries */
+    /* idx includes the aggregate row, so per-core count is idx − 1 */
     *cores = idx - 1;
     return 0;
 }
@@ -56,19 +100,19 @@ void cpu_get_info(CpuInfo *info) {
 
     info->num_cores = cores;
 
-    /* Aggregate usage (index 0) */
+    /* Aggregate usage: index 0 holds the "cpu" (all-core sum) line */
     long long dtotal = total(&cur[0]) - total(&prev[0]);
     long long didle  = idle_ticks(&cur[0]) - idle_ticks(&prev[0]);
     info->total_usage = dtotal > 0 ? (1.0 - (double)didle / dtotal) * 100.0 : 0.0;
 
-    /* Per-core usage (indices 1..N) */
+    /* Per-core usage: indices 1..N correspond to "cpu0", "cpu1", … */
     for (int i = 0; i < cores && i < MAX_CORES; i++) {
         dtotal = total(&cur[i + 1]) - total(&prev[i + 1]);
         didle  = idle_ticks(&cur[i + 1]) - idle_ticks(&prev[i + 1]);
         info->usage[i] = dtotal > 0 ? (1.0 - (double)didle / dtotal) * 100.0 : 0.0;
     }
 
-    /* Save current as previous for next call */
+    /* Advance baseline so the next call computes the next interval's delta */
     memcpy(prev, cur, sizeof(prev));
     num_cores = cores;
 }

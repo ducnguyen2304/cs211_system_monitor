@@ -4,7 +4,7 @@ A lightweight terminal-based system monitor written in C.
 Displays real-time CPU usage per core, RAM/swap, and a live process table — all read directly from the Linux `/proc` filesystem.
 
 ```
- System Monitor  (press 'q' to quit)
+ System Monitor  (q=quit  ↑↓=select  t=threads  k=kill  r=renice  s=signal)
 ────────────────────────────────────────────────────────────────
  CPU  (8 cores)
   Total  [||||||||||||||                ] 47.2%
@@ -16,10 +16,12 @@ Displays real-time CPU usage per core, RAM/swap, and a live process table — al
   RAM    [||||||||||||||||              ] 49.8%
     7500 MB used / 15360 MB total  (avail: 7900 MB)
 ────────────────────────────────────────────────────────────────
+ Top 5 Recent:  [firefox 12.4%]   [code 8.1%]   [sysmon 0.8%]   ...
+────────────────────────────────────────────────────────────────
  Processes (312)
- PID     Name                  CPU%   Mem(MB)  S
- 1234    firefox               12.4    512.00  S
- 5678    code                   8.1    340.20  S
+ PID     Name                CPU%   Mem(MB)  S   NI PRI  POL  THR
+ 1234    firefox             12.4    512.00  S    0  20  NRM   16
+ 5678    code                 8.1    340.20  S    0  20  NRM    8
 ```
 
 ---
@@ -249,9 +251,10 @@ Sampling runs in a **background pthread** so the UI stays responsive. Per-thread
 |-----|--------|
 | `q` or `Q` | Quit |
 | `↑` / `↓` | Navigate process list |
-| `k` | Kill selected process |
-| `r` | Renice selected process |
-| `s` | Send signal to selected process |
+| `t` or `Enter` | Toggle per-thread expansion for selected process |
+| `k` | Kill selected process (sends SIGKILL) |
+| `r` | Renice selected process (set nice value −20..19) |
+| `s` | Send any signal to selected process |
 
 ---
 

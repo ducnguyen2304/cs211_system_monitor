@@ -30,6 +30,40 @@
 /** Width in characters of each filled/unfilled progress bar. */
 #define BAR_WIDTH 28
 
+/* Ring buffer tracking the 5 most recently active processes. */
+#define RECENT_MAX 5
+typedef struct {
+    int    pid;
+    char   name[64];
+    double cpu_percent;
+} RecentEntry;
+static RecentEntry recent_active[RECENT_MAX];
+static int         recent_count = 0;
+
+static void update_recent(int pid, const char *name, double cpu_pct) {
+    /* Remove existing entry for this pid, if any. */
+    for (int i = 0; i < recent_count; i++) {
+        if (recent_active[i].pid == pid) {
+            memmove(&recent_active[i], &recent_active[i + 1],
+                    (recent_count - i - 1) * sizeof(RecentEntry));
+            recent_count--;
+            break;
+        }
+    }
+    /* Shift down to make room at index 0 (most recent). */
+    if (recent_count == RECENT_MAX)
+        memmove(&recent_active[1], &recent_active[0],
+                (RECENT_MAX - 1) * sizeof(RecentEntry));
+    else
+        memmove(&recent_active[1], &recent_active[0],
+                recent_count * sizeof(RecentEntry));
+    recent_active[0].pid = pid;
+    strncpy(recent_active[0].name, name, sizeof(recent_active[0].name) - 1);
+    recent_active[0].name[sizeof(recent_active[0].name) - 1] = '\0';
+    recent_active[0].cpu_percent = cpu_pct;
+    if (recent_count < RECENT_MAX) recent_count++;
+}
+
 /* ncurses colour pair identifiers. */
 #define CP_GREEN  1
 #define CP_YELLOW 2
@@ -263,25 +297,30 @@ void display_update(const CpuInfo *cpu, const MemInfo *mem, const ProcList *proc
     }
     mvhline(row++, 0, ACS_HLINE, max_x);
 
-    /* ── Top 5 Active Processes ── */
+    /* ── Top 5 Recent Processes ── */
     {
+        /* Update ring buffer with every process that has non-zero CPU. */
+        for (int vi = vis_count - 1; vi >= 0; vi--) {
+            const ProcInfo *p = &procs->procs[vis[vi]];
+            if (p->cpu_percent >= 0.01)
+                update_recent(p->pid, p->name, p->cpu_percent);
+        }
+
         attron(A_BOLD | COLOR_PAIR(CP_CYAN));
-        mvprintw(row, 0, " Top 5 Active:");
+        mvprintw(row, 0, " Top 5 Recent:");
         attroff(A_BOLD | COLOR_PAIR(CP_CYAN));
 
         int chip_w = (max_x - 2) / 5;
         if (chip_w < 14) chip_w = 14;
         int cx = 16;
-        int shown = 0;
-        for (int vi = 0; vi < vis_count && shown < 5; vi++) {
-            const ProcInfo *p = &procs->procs[vis[vi]];
-            int cp = bar_color(p->cpu_percent);
+        for (int i = 0; i < recent_count; i++) {
+            int cp = bar_color(recent_active[i].cpu_percent);
             attron(COLOR_PAIR(cp) | A_BOLD);
             mvprintw(row, cx, "[%-.*s %.1f%%]",
-                     chip_w - 9, p->name, p->cpu_percent);
+                     chip_w - 9, recent_active[i].name,
+                     recent_active[i].cpu_percent);
             attroff(COLOR_PAIR(cp) | A_BOLD);
             cx += chip_w;
-            shown++;
         }
         row++;
     }

@@ -239,6 +239,8 @@ The program reads directly from the Linux kernel's `/proc` virtual filesystem:
 
 No external monitoring agents or network calls — everything comes from the kernel.
 
+Sampling runs in a **background pthread** so the UI stays responsive. Per-thread stats are read from `/proc/[pid]/task/*`, and scheduling info (priority, nice, policy) from `/proc/[pid]/stat`.
+
 ---
 
 ## Controls
@@ -246,6 +248,10 @@ No external monitoring agents or network calls — everything comes from the ker
 | Key | Action |
 |-----|--------|
 | `q` or `Q` | Quit |
+| `↑` / `↓` | Navigate process list |
+| `k` | Kill selected process |
+| `r` | Renice selected process |
+| `s` | Send signal to selected process |
 
 ---
 
